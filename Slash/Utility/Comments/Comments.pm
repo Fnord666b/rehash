@@ -1486,6 +1486,13 @@ sub postProcessComment {
 	$comm->{comment} = parseDomainTags($comm->{comment}, !$comm->{anon} && $comm->{fakeemail});
 	$comm->{comment} = apply_rehash_tags($comm->{comment});
 
+	# Check if spam_flag is set
+    if ($comm->{spam_flag}) {
+        $comm->{subject} = '** Flagged Comment **';
+        $comm->{comment} = '** This comment has been flagged for review. **';
+		$comm->{sig} = '';
+    }
+
 	if (!$from_db) {
 		
 		my $extras = [];

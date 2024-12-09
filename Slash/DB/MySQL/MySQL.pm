@@ -16,6 +16,7 @@ use DateTime ();
 use Data::Dumper;
 use Storable qw(thaw nfreeze);
 use URI ();
+use APR::SockAddr ();
 
 use Slash::Utility;
 use Slash::Constants ':messages';
@@ -4563,7 +4564,7 @@ sub setKnownOpenProxy {
 	my $xff;
 	if ($port) {
 		my $r = Apache2::RequestUtil->request;
-		$xff = $r->headers_in->get('X-Forwarded-For') if $r;
+		$xff = $r->headers_in->get('X-Real-IP') if $r;
 #use Data::Dumper; print STDERR "sKOP headers_in: " . Dumper([ $r->headers_in ]) if $r;
 	}
 	$xff = undef unless $xff && length($xff) >= 7
@@ -6187,7 +6188,7 @@ sub getCommentReply {
 		 comments.points AS points, comments.tweak AS tweak, pointsorig, tweak_orig,
 		 comment_text.comment AS comment, realname, nickname,
 		 fakeemail, homepage, comments.cid AS cid, sid,
-		 users.uid AS uid, reason, karma_bonus";
+		 users.uid AS uid, reason, karma_bonus, spam_flag";
 	if ($constants->{plugin}{Subscribe} && $constants->{subscribe}) {
 		$select .= ", subscriber_bonus";
 	}
@@ -6274,7 +6275,7 @@ sub getThreadedCommentsForUser {
 		. "tweak, tweak_orig, subject_orig, children, "
 		. "pid, pid AS original_pid, sid, lastmod, reason, "
 		. "journal_last_entry_date, ipid, subnetid, "
-		. "karma_bonus, "
+		. "karma_bonus, spam_flag, "
 		. "len, badge_id, comment_text.comment as comment";
 	if ($constants->{plugin}{Subscribe} && $constants->{subscribe}) {
 		$select .= ", subscriber_bonus";
@@ -6343,7 +6344,7 @@ sub getFlatCommentsForUser {
 		. "tweak, tweak_orig, subject_orig, children, "
 		. "pid, pid AS original_pid, sid, lastmod, reason, "
 		. "journal_last_entry_date, ipid, subnetid, "
-		. "karma_bonus, "
+		. "karma_bonus, spam_flag, "
 		. "len, badge_id, comment_text.comment as comment";
 	if ($constants->{plugin}{Subscribe} && $constants->{subscribe}) {
 		$select .= ", subscriber_bonus";
@@ -6403,7 +6404,7 @@ sub getCommentsForUser {
 		. "tweak, tweak_orig, subject_orig, "
 		. "pid, pid AS original_pid, sid, lastmod, reason, "
 		. "journal_last_entry_date, ipid, subnetid, "
-		. "karma_bonus, "
+		. "karma_bonus, spam_flag, "
 		. "len, badge_id, comment_text.comment as comment";
 	if ($constants->{plugin}{Subscribe} && $constants->{subscribe}) {
 		$select .= ", subscriber_bonus";
@@ -7538,20 +7539,22 @@ sub getStoriesEssentials {
 			# If we are excluding any topics, then add a LEFT JOIN
 			# No Left JOIN, do a sub query --paulej72
 			my $tid_x_str = join(",", @$tid_x);
-			push @stories_where, "stories.stoid NOT IN (SELECT story_topics_rendered.stoid FROM story_topics_rendered WHERE story_topics_rendered.tid IN ($tid_x_str))";
+			push @stories_where, "stories.stoid NOT IN (SELECT story_topics_rendered.stoid FROM story_topics_rendered WHERE story_topics_rendered.tid IN ($tid_x_str) GROUP BY story_topics_rendered.stoid)";
 		}
 
 		# If we'd done multiple SELECTs, this logic would have been
 		# done on the story_topics_rendered table;  as it is, these
 		# phrases have to go into the JOIN.
 		# No JOIN, do a sub query --paulej72
-		push @stories_where, "stories.stoid IN (SELECT story_topics_rendered.stoid FROM story_topics_rendered WHERE $tid_in_where)";
 
 		# The logic can return multiple story_topics_rendered rows
 		# with the same stoid, and if it does, group them together
 		# so each story only gets returned once.
-		$other = "GROUP BY stories.stoid $other";
-
+		#
+		# TMB
+		# Wouldn't it make sense to put the GROUP BY on the fucking *SUBQUERY* then?
+		# At ~25k stories it makes the goddamned difference between being a >15s query and a <0.1s query.
+		push @stories_where, "stories.stoid IN (SELECT story_topics_rendered.stoid FROM story_topics_rendered WHERE $tid_in_where GROUP BY story_topics_rendered.stoid)";
 	}
 
 	# Pull together the where clauses into one clause.
@@ -13374,6 +13377,64 @@ sub isCommentPromoted {
 sub logCommentPromotion {
 	my($self, $cid) = @_;
 	$self->sqlInsert("comment_promote_log", { cid => $cid, -ts => "NOW()" });
+}
+
+
+sub doFlagSpam {
+    my ($self, $cid, $spam_flag, $mod_uid, $mod_reason) = @_;
+
+    # Begin transaction
+    $self->sqlDo("SET AUTOCOMMIT=0");
+
+    # Prepare the data for the update
+    my $data = { spam_flag => $spam_flag };
+    my $where = "cid = " . $self->sqlQuote($cid);
+
+    # Update the spam flag using sqlUpdate
+    my $result = $self->sqlUpdate('comments', $data, $where);
+
+    if ($result) {
+        # Log the reason in the comments_audit table
+        $self->logCommentAudit($cid, $mod_uid, $mod_reason, $spam_flag);
+
+        # Commit transaction
+        $self->sqlDo("COMMIT");
+        $self->sqlDo("SET AUTOCOMMIT=1");
+
+        return 1;  # Success
+    } else {
+        # Rollback transaction
+        $self->sqlDo("ROLLBACK");
+        $self->sqlDo("SET AUTOCOMMIT=1");
+
+        return 0;  # Failure
+    }
+}
+
+sub logCommentAudit {
+    my ($self, $cid, $mod_uid, $mod_reason, $spam_flag) = @_;
+    my $data = {
+        cid        => $cid,
+        -date       => 'NOW()',  # Use a reference to a raw SQL expression
+        mod_uid    => $mod_uid,
+        mod_reason => $mod_reason,
+        spam_flag  => $spam_flag,
+    };
+    $self->sqlInsert("comments_audit", $data);
+}
+
+sub getCommentsAudit {
+    my ($self, $cid, $limit) = @_;
+
+    # Default limit to 100 if not provided
+    $limit = 100 unless defined $limit;
+
+    my $select = '*';
+    my $from = 'comments_audit';
+    my $where = $cid ? "cid = " . $self->sqlQuote($cid) : undef;
+    my $other = $cid ? '' : "ORDER BY date DESC" . ($limit ? " LIMIT $limit" : '');
+
+    return $self->sqlSelectMany($select, $from, $where, $other);
 }
 
 sub createProject {
